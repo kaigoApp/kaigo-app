@@ -3,24 +3,23 @@ import sqlite3
 import pandas as pd
 from datetime import datetime, date
 
-# --- 1. スマホ最適化CSS ---
+# --- 1. ページ設定 & スマホ用CSS ---
+st.set_page_config(page_title="介護記録アプリ", layout="wide")
+
 def inject_mobile_css():
     st.markdown("""
     <style>
-    html, body, [class*="css"] { font-size: 16px !important; }
-    .stButton > button {
-        width: 100%; height: 3.5rem; border-radius: 12px;
-        font-weight: bold; margin-bottom: 10px;
-    }
-    .app-title { font-size: 1.4rem; font-weight: bold; text-align: center; padding: 10px; }
-    .critical-text { color: #d32f2f !important; font-weight: bold; }
-    .handover-card { background: #fff; border: 1px solid #ddd; padding: 15px; border-radius: 15px; margin-bottom: 10px; box-shadow: 2px 2px 5px rgba(0,0,0,0.05); }
-    .reaction-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+    .stButton > button { width: 100%; border-radius: 10px; height: 3rem; font-weight: bold; }
+    .res-card { background: white; border-radius: 15px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); border-left: 5px solid #2e7d32; margin-bottom: 15px; }
+    .critical-card { background: #fff5f5; border-left: 5px solid #d32f2f; padding: 15px; border-radius: 10px; margin-bottom: 10px; }
+    .app-header { font-size: 1.8rem; font-weight: bold; color: #333; margin-bottom: 20px; text-align: center; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. データベース機能（②〜⑤の項目を保持） ---
-DB_PATH = "care_records_v2.db"
+inject_mobile_css()
+
+# --- 2. データベース初期化 ---
+DB_PATH = "care_app_v3.db"
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -28,122 +27,93 @@ def get_db():
 
 def init_db():
     with get_db() as conn:
-        # 利用者マスター
-        conn.execute("""CREATE TABLE IF NOT EXISTS residents 
-            (id INTEGER PRIMARY KEY, name TEXT, kubun TEXT, disease TEXT)""")
-        # 記録テーブル（巡視項目を含む）
-        conn.execute("""CREATE TABLE IF NOT EXISTS records 
-            (id INTEGER PRIMARY KEY, resident_id INTEGER, record_time TEXT, 
-             scene TEXT, status TEXT, note TEXT, is_critical INTEGER, recorder TEXT)""")
-        # 申し送り・いいね
-        conn.execute("""CREATE TABLE IF NOT EXISTS handovers 
-            (id INTEGER PRIMARY KEY, content TEXT, recorder TEXT, created_at TEXT)""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS reactions 
-            (handover_id INTEGER, user_name TEXT, UNIQUE(handover_id, user_name))""")
+        conn.execute("CREATE TABLE IF NOT EXISTS residents (id INTEGER PRIMARY KEY, name TEXT, kubun TEXT, disease TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS records (id INTEGER PRIMARY KEY, res_id INTEGER, time TEXT, status TEXT, note TEXT, is_critical INTEGER, recorder TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS handovers (id INTEGER PRIMARY KEY, content TEXT, recorder TEXT, time TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS likes (h_id INTEGER, user TEXT, UNIQUE(h_id, user))")
         
-        # 利用者データの復活
         if not conn.execute("SELECT * FROM residents").fetchone():
-            data = [
-                ('佐藤 太郎', '区分4', '認知症'),
-                ('鈴木 花子', '区分3', '肢体不自由'),
-                ('田中 次郎', '区分5', '統合失調症'),
-                ('山田 恒一', '区分2', '高次脳機能障害')
-            ]
-            conn.executemany("INSERT INTO residents (name, kubun, disease) VALUES (?,?,?)", data)
+            users = [('佐藤 太郎', '区分4', '認知症'), ('山田 恒一', '区分2', '高次脳機能障害'), 
+                     ('田中 次郎', '区分5', '統合失調症'), ('鈴木 花子', '区分3', '肢体不自由')]
+            conn.executemany("INSERT INTO residents (name, kubun, disease) VALUES (?,?,?)", users)
 
-# --- 3. メイン処理 ---
-inject_mobile_css()
 init_db()
 
-st.markdown('<div class="app-title">🧾 介護記録（スマホ最適化版）</div>', unsafe_allow_html=True)
-
-# 記録者名の保持
-if "recorder" not in st.session_state:
-    st.session_state.recorder = ""
-
+# --- 3. サイドバー設定 ---
 with st.sidebar:
-    st.session_state.recorder = st.text_input("✍ 記録者氏名", value=st.session_state.recorder)
-    target_date = st.date_input("📅 記録日", date.today())
+    st.header("⚙ 設定")
+    target_date = st.date_input("記録日", date.today())
+    shift = st.radio("勤務区分", ["日勤", "夜勤"])
+    recorder = st.text_input("記録者名（必須）", placeholder="例：毛利 正二")
 
-tab1, tab2, tab3 = st.tabs(["✍ 入力", "📋 経過", "📢 申し送り"])
+# --- 4. メイン画面 ---
+st.markdown('<div class="app-header">📑 介護記録システム</div>', unsafe_allow_html=True)
 
-# --- タブ1: 入力 ---
+tab1, tab2, tab3 = st.tabs(["👥 利用者一覧", "✍ 記録入力", "📢 申し送り"])
+
+# --- TAB 1: 利用者一覧（カード形式） ---
 with tab1:
     res_df = pd.read_sql("SELECT * FROM residents", get_db())
-    # セレクトボックスを大きく（スマホ対応）
-    selected_name = st.selectbox("👤 利用者を選択", res_df["name"].tolist())
-    res_info = res_df[res_df["name"] == selected_name].iloc[0]
-    st.caption(f"🏥 {res_info['kubun']} | {res_info['disease']}")
+    cols = st.columns(2)
+    for idx, row in res_df.iterrows():
+        with cols[idx % 2]:
+            st.markdown(f"""
+            <div class="res-card">
+                <h3>{row['name']}</h3>
+                <p>区分: {row['kubun']} / 病名: {row['disease']}</p>
+            </div>
+            """, unsafe_allow_html=True)
+            if st.button(f"{row['name']}さんを選択", key=f"sel_{row['id']}"):
+                st.session_state.selected_res = row['name']
+                st.session_state.selected_id = row['id']
+                st.success(f"{row['name']}さんを選択しました。「記録入力」タブへ進んでください。")
 
-    st.divider()
-    
-    # 巡視の入力（時刻選択の自動連動）
-    st.subheader("🌙 巡視・様子")
-    p_time = st.time_input("巡視時刻（これが記録時刻になります）", datetime.now().time())
-    p_status = st.selectbox("ご様子", ["就寝中", "安眠中", "覚醒", "トイレ介助", "離床", "その他"])
-    
-    # 特記事項の入力（赤文字連動）
-    st.subheader("📝 支援内容・特記事項")
-    note = st.text_area("内容を入力してください", placeholder="具体的な様子など")
-    is_critical = st.checkbox("📢 【重要】特記事項として報告する", value=False)
-    
-    # 特記ありならボタンを赤く
-    btn_label = "✅ 記録を保存" if not is_critical else "🚨 特記事項として保存"
-    
-    if st.button(btn_label):
-        if not st.session_state.recorder:
-            st.error("左メニューから『記録者名』を入力してください")
-        else:
-            with get_db() as conn:
-                rec_time = f"{target_date} {p_time.strftime('%H:%M')}"
-                conn.execute("""INSERT INTO records 
-                    (resident_id, record_time, status, note, is_critical, recorder) 
-                    VALUES (?,?,?,?,?,?)""",
-                    (int(res_info['id']), rec_time, p_status, note, 1 if is_critical else 0, st.session_state.recorder))
-                
-                # 特記ありなら申し送りへ自動反映
-                if is_critical:
-                    conn.execute("INSERT INTO handovers (content, recorder, created_at) VALUES (?,?,?)",
-                                 (f"{selected_name}: {p_status} / {note}", st.session_state.recorder, rec_time))
-            st.success("保存完了！")
-            st.rerun()
-
-# --- タブ2: 経過一覧 ---
+# --- TAB 2: 記録入力 ---
 with tab2:
-    st.subheader(f"📋 {selected_name} の経過")
-    records = pd.read_sql(f"SELECT * FROM records WHERE resident_id = {res_info['id']} ORDER BY record_time DESC", get_db())
-    
-    for _, row in records.iterrows():
-        with st.container():
-            time_str = row['record_time'].split(" ")[1] # 時刻だけ抽出
-            if row['is_critical']:
-                st.markdown(f"🔴 **{time_str}** <span class='critical-text'>【特記】 {row['status']}</span>", unsafe_allow_html=True)
-                st.markdown(f"<div class='critical-text'>{row['note']}</div>", unsafe_allow_html=True)
+    if "selected_res" not in st.session_state:
+        st.warning("「利用者一覧」から対象者を選択してください。")
+    else:
+        st.subheader(f"✍ {st.session_state.selected_res} さんの記録")
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            p_time = st.time_input("巡視時刻", datetime.now().time())
+        with c2:
+            p_status = st.selectbox("様子", ["安眠中", "就寝中", "覚醒", "排泄介助", "離床中"])
+        
+        note = st.text_area("内容・特記事項", placeholder="普段と違う様子があれば記入")
+        is_critical = st.checkbox("🚨 特記事項（申し送りにも自動反映）")
+        
+        if st.button("この内容で保存する"):
+            if not recorder:
+                st.error("サイドバーで記録者名を入力してください。")
             else:
-                st.markdown(f"⚪ **{time_str}** {row['status']}")
-                if row['note']: st.info(row['note'])
-            st.caption(f"記録者: {row['recorder']}")
-            st.divider()
+                full_time = f"{target_date} {p_time.strftime('%H:%M')}"
+                with get_db() as conn:
+                    conn.execute("INSERT INTO records (res_id, time, status, note, is_critical, recorder) VALUES (?,?,?,?,?,?)",
+                                 (st.session_state.selected_id, full_time, p_status, note, 1 if is_critical else 0, recorder))
+                    if is_critical:
+                        conn.execute("INSERT INTO handovers (content, recorder, time) VALUES (?,?,?)",
+                                     (f"{st.session_state.selected_res}: {p_status} / {note}", recorder, full_time))
+                st.success("記録を保存しました！")
 
-# --- タブ3: 申し送り（いいね機能） ---
+# --- TAB 3: 申し送り ---
 with tab3:
-    st.subheader("📢 職員連絡帳")
-    h_df = pd.read_sql("SELECT * FROM handovers ORDER BY id DESC LIMIT 20", get_db())
-    
+    st.subheader("📢 職員申し送り一覧")
+    h_df = pd.read_sql("SELECT * FROM handovers ORDER BY id DESC", get_db())
     for _, h in h_df.iterrows():
-        st.markdown(f"""<div class="handover-card">
-            <small>{h['created_at']} 投稿者: {h['recorder']}</small><br>
+        st.markdown(f"""<div class="critical-card">
+            <small>{h['time']} 記入者: {h['recorder']}</small><br>
             <strong>{h['content']}</strong>
         </div>""", unsafe_allow_html=True)
         
-        # リアクション（いいね）機能
-        reactions = pd.read_sql(f"SELECT user_name FROM reactions WHERE handover_id = {h['id']}", get_db())
-        user_list = reactions['user_name'].tolist()
-        
-        # 誰が押したか表示
-        cols = st.columns([0.2, 0.8])
-        with cols[0]:
-            if st.button(f"👍 {len(user_list)}", key=f"h_{h['id']}"):
-                if st.session_state.recorder and st.session_state.recorder not in user_list:
-                    with get_db() as conn:
-                        conn.execute("INSERT INTO reactions (handover
+        # いいね機能
+        likes = pd.read_sql(f"SELECT user FROM likes WHERE h_id = {h['id']}", get_db())
+        user_list = likes['user'].tolist()
+        if st.button(f"👍 確認済 {len(user_list)}", key=f"lk_{h['id']}"):
+            if recorder and recorder not in user_list:
+                with get_db() as conn:
+                    conn.execute("INSERT INTO likes (h_id, user) VALUES (?,?)", (h['id'], recorder))
+                st.rerun()
+        if user_list:
+            st.caption(f"確認者: {', '.join(user_list)}")
