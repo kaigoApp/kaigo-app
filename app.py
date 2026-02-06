@@ -3,15 +3,18 @@
 # グループホーム向け 介護記録アプリ（Streamlit + SQLite）
 # Mobile First / 1カラム最適化版（2026-02）
 #
-# ✅ 追加/修正（今回）
-# 1) バイタル空欄エラー防止＆デフォルト値保存
-#    - 体温36.0 / 血圧120/80 / 脈拍70 / SpO2 98
-#    - 朝/夕「記録する」ONなら空欄でもデフォルトで保存
-# 2) 新タブ「📊 実施状況（カード型）」：全利用者の当日実施状況を一覧
-# 3) 週報（印刷用）に「列型の提出向けテーブル」を追加
-#
-# 既存の「利用者マスタ（区分・病名）」「申し送り自由記述」「いいね」機能は維持。
-# 日本時間（JST）維持。
+# ✅ 主な仕様
+# - 4タブ: 「入力」「経過一覧」「申し送り」「印刷用出力（週報）」
+# - 入力は基本1カラム（st.columnsを多用しない）
+# - 時刻入力の二度手間を廃止
+#    * 巡視がある場合：最新（最大）の巡視時刻を主時刻として自動採用
+#    * 巡視がない場合：現在時刻（5分丸め）を主時刻として自動採用
+# - ⑥特記事項に1文字でも入力 or チェックON の間は赤強調（タイトル/保存ボタン/①見出し）
+# - residents に kubun / disease を追加（AI分析の下地）
+# - 申し送りは 👍 のみ（誰が押したかを表示、履歴も保持）
+# - バイタルはデフォルト未入力（空欄）。入力して保存した項目だけ記録。
+# - 週報（行政提出用）をCSV/Excel出力
+# - サイドバーに全データバックアップ（CSV.zip）
 #
 # 起動:
 #   py -m pip install streamlit pandas openpyxl
@@ -20,10 +23,11 @@
 
 import os
 import sqlite3
+import io
 import zipfile
 from io import BytesIO
 from pathlib import Path
-from datetime import datetime, time as dtime, timezone, timedelta
+from datetime import date, datetime, time as dtime, timezone, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -32,20 +36,12 @@ import streamlit as st
 # --- Timezone (JST) ---
 JST = timezone(timedelta(hours=9))
 
-# --- Vital default values (requested) ---
-VITAL_DEFAULTS = {
-    "temp": 36.0,
-    "bp_sys": 120,
-    "bp_dia": 80,
-    "pulse": 70,
-    "spo2": 98,
-}
-
 
 # -------------------------
 # Paths / DB
 # -------------------------
 def get_db_path() -> Path:
+    # Streamlit Cloud や Windows で確実に書き込める場所に置く（read-only回避）
     env = os.environ.get("KAIGO_DB_PATH", "").strip()
     if env:
         p = Path(env).expanduser()
@@ -64,6 +60,7 @@ DB_PATH = get_db_path()
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     conn.execute("PRAGMA foreign_keys = ON;")
+    # ロック耐性
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
@@ -99,6 +96,7 @@ def ensure_column(conn, table: str, col: str, col_def_sql: str):
 
 
 def update_resident_master(conn, *, resident_id: int, kubun: str, disease: str):
+    """利用者マスタ（区分・症名）を更新する。列が無い場合も安全に追加してから更新する。"""
     ensure_column(conn, "residents", "kubun", "kubun TEXT")
     ensure_column(conn, "residents", "disease", "disease TEXT")
     exec_sql(
@@ -132,6 +130,8 @@ def init_db(conn):
         );
         """,
     )
+
+    # residents extra fields（AI連携の下地）
     ensure_column(conn, "residents", "kubun", "kubun TEXT")
     ensure_column(conn, "residents", "disease", "disease TEXT")
 
@@ -210,6 +210,7 @@ def init_db(conn):
         """,
     )
 
+    # 申し送り
     exec_sql(
         conn,
         """
@@ -248,6 +249,7 @@ def init_db(conn):
     except Exception:
         pass
 
+    # seed
     units = fetch_df(conn, "SELECT id FROM units LIMIT 1;")
     if units.empty:
         exec_sql(conn, "INSERT INTO units(name) VALUES (?)", ("ユニットA",))
@@ -307,6 +309,7 @@ def safe_float(x):
 
 
 def parse_int_str(s: str):
+    """Text input -> int or None (blank/invalid -> None)."""
     if s is None:
         return None
     s = str(s).strip()
@@ -319,6 +322,7 @@ def parse_int_str(s: str):
 
 
 def parse_float_str(s: str):
+    """Text input -> float or None (blank/invalid -> None)."""
     if s is None:
         return None
     s = str(s).strip()
@@ -374,6 +378,7 @@ def latest_vitals_anyday(conn, resident_id: int):
 
 
 def list_records_for_day(conn, resident_id: int, target_date: str):
+    # 経過一覧は「直近が上」＝降順
     return fetch_df(
         conn,
         """
@@ -494,6 +499,7 @@ def soft_delete_record(conn, record_id: int):
 # Export / Weekly report
 # -------------------------
 def export_all_tables_zip(conn) -> bytes:
+    """全テーブルをCSVにしてzipで返す（バックアップ用）。"""
     tables = fetch_df(
         conn,
         """
@@ -515,6 +521,7 @@ def export_all_tables_zip(conn) -> bytes:
 
 
 def list_records_between(conn, resident_id: int, start_date: str, end_date: str) -> pd.DataFrame:
+    """start_date〜end_date（両端含む）のレコードを取得（削除除外）。"""
     return fetch_df(
         conn,
         """
@@ -535,6 +542,7 @@ def list_records_between(conn, resident_id: int, start_date: str, end_date: str)
 
 
 def build_week_timeline(conn, resident_id: int, start_date: str, end_date: str) -> pd.DataFrame:
+    """1週間分を“項目ごと”にばらして時系列で返す（印刷/提出用）。"""
     recs = list_records_between(conn, resident_id, start_date, end_date)
     if recs.empty:
         return pd.DataFrame(columns=["日付", "時刻", "項目", "内容", "勤務", "記録者"])
@@ -553,10 +561,12 @@ def build_week_timeline(conn, resident_id: int, start_date: str, end_date: str) 
                 return
             rows.append({"日付": d, "時刻": t, "項目": item, "内容": content, "勤務": shift, "記録者": who})
 
+        # ① 支援記録
         sc = scene_display(r.get("scene"))
         sn = (r.get("scene_note") or "").strip()
         add("①支援記録", f"{sc}：{sn}" if sn else f"{sc}")
 
+        # ② バイタル（朝/夕）
         def vit_line(prefix, temp, sys, dia, pulse, spo2):
             parts = []
             if temp is not None:
@@ -569,15 +579,28 @@ def build_week_timeline(conn, resident_id: int, start_date: str, end_date: str) 
                 parts.append(f"SpO₂ {int(spo2)}%")
             return (prefix + " " + " / ".join(parts)).strip() if parts else ""
 
-        am = vit_line("朝", safe_float(r.get("temp_am")), safe_int(r.get("bp_sys_am")), safe_int(r.get("bp_dia_am")),
-                      safe_int(r.get("pulse_am")), safe_int(r.get("spo2_am")))
-        pm = vit_line("夕", safe_float(r.get("temp_pm")), safe_int(r.get("bp_sys_pm")), safe_int(r.get("bp_dia_pm")),
-                      safe_int(r.get("pulse_pm")), safe_int(r.get("spo2_pm")))
+        am = vit_line(
+            "朝",
+            safe_float(r.get("temp_am")),
+            safe_int(r.get("bp_sys_am")),
+            safe_int(r.get("bp_dia_am")),
+            safe_int(r.get("pulse_am")),
+            safe_int(r.get("spo2_am")),
+        )
+        pm = vit_line(
+            "夕",
+            safe_float(r.get("temp_pm")),
+            safe_int(r.get("bp_sys_pm")),
+            safe_int(r.get("bp_dia_pm")),
+            safe_int(r.get("pulse_pm")),
+            safe_int(r.get("spo2_pm")),
+        )
         if am:
             add("②バイタル", am)
         if pm:
             add("②バイタル", pm)
 
+        # ③ 食事
         meals = []
         if int(r.get("meal_bf_done") or 0) == 1:
             meals.append(f"朝 {int(r.get('meal_bf_score') or 0)}/10")
@@ -588,6 +611,7 @@ def build_week_timeline(conn, resident_id: int, start_date: str, end_date: str) 
         if meals:
             add("③食事", " / ".join(meals))
 
+        # ④ 服薬
         meds = []
         if int(r.get("med_morning") or 0) == 1:
             meds.append("朝")
@@ -600,10 +624,12 @@ def build_week_timeline(conn, resident_id: int, start_date: str, end_date: str) 
         if meds:
             add("④服薬", " / ".join(meds))
 
+        # ⑥ 特記事項
         note = (r.get("note") or "").strip()
         if note:
             add("⑥特記事項", note)
 
+        # ⑤ 巡視（巡視時刻優先）
         if int(r.get("patrol_count") or 0) > 0:
             pat = load_patrols(conn, rid)
             for _, p in pat.iterrows():
@@ -618,7 +644,9 @@ def build_week_timeline(conn, resident_id: int, start_date: str, end_date: str) 
                 if bits:
                     head += "（" + " / ".join(bits) + "）"
                 line = head + (f" / メモ：{memo}" if memo else "")
-                rows.append({"日付": d, "時刻": pt if pt != "--:--" else t, "項目": "⑤巡視", "内容": line, "勤務": shift, "記録者": who})
+                rows.append(
+                    {"日付": d, "時刻": pt if pt != "--:--" else t, "項目": "⑤巡視", "内容": line, "勤務": shift, "記録者": who}
+                )
 
     df = pd.DataFrame(rows)
 
@@ -634,103 +662,6 @@ def build_week_timeline(conn, resident_id: int, start_date: str, end_date: str) 
     df["_k"] = df.apply(sort_key, axis=1)
     df = df.sort_values("_k", ascending=True).drop(columns=["_k"]).reset_index(drop=True)
     return df
-
-
-def build_week_table_for_submission(conn, residents_df: pd.DataFrame, unit_name: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """
-    行政提出を意識した「列型」週報テーブル。
-    - 日付・利用者・区分/病名・バイタル/食事/服薬を列に整形
-    """
-    rows = []
-    for _, rr in residents_df.iterrows():
-        rid = int(rr["id"])
-        rname = str(rr["name"])
-        kubun = (str(rr.get("kubun") or "")).strip() or "-"
-        disease = (str(rr.get("disease") or "")).strip() or "-"
-
-        df = list_records_between(conn, rid, start_date, end_date)
-        if df.empty:
-            continue
-
-        for _, r in df.iterrows():
-            t = fmt_time(r.get("record_time_hh"), r.get("record_time_mm"))
-            who = str(r.get("recorder_name") or "")
-
-            # vitals
-            def vpack(prefix):
-                if prefix == "am":
-                    temp = safe_float(r.get("temp_am"))
-                    sys = safe_int(r.get("bp_sys_am"))
-                    dia = safe_int(r.get("bp_dia_am"))
-                    pulse = safe_int(r.get("pulse_am"))
-                    spo2 = safe_int(r.get("spo2_am"))
-                else:
-                    temp = safe_float(r.get("temp_pm"))
-                    sys = safe_int(r.get("bp_sys_pm"))
-                    dia = safe_int(r.get("bp_dia_pm"))
-                    pulse = safe_int(r.get("pulse_pm"))
-                    spo2 = safe_int(r.get("spo2_pm"))
-                if temp is None and sys is None and dia is None and pulse is None and spo2 is None:
-                    return ""
-                parts = []
-                if temp is not None:
-                    parts.append(f"{temp:.1f}")
-                else:
-                    parts.append("")
-                bp = ""
-                if sys is not None or dia is not None:
-                    bp = f"{sys if sys is not None else '--'}/{dia if dia is not None else '--'}"
-                parts.append(bp)
-                parts.append(str(pulse) if pulse is not None else "")
-                parts.append(f"{spo2}%" if spo2 is not None else "")
-                return " / ".join([p for p in parts if p != ""])
-
-            am_v = vpack("am")
-            pm_v = vpack("pm")
-
-            # meals
-            bf = f"{int(r.get('meal_bf_score') or 0)}/10" if int(r.get("meal_bf_done") or 0) == 1 else ""
-            lu = f"{int(r.get('meal_lu_score') or 0)}/10" if int(r.get("meal_lu_done") or 0) == 1 else ""
-            di = f"{int(r.get('meal_di_score') or 0)}/10" if int(r.get("meal_di_done") or 0) == 1 else ""
-
-            # meds
-            med_m = "済" if int(r.get("med_morning") or 0) == 1 else ""
-            med_n = "済" if int(r.get("med_noon") or 0) == 1 else ""
-            med_e = "済" if int(r.get("med_evening") or 0) == 1 else ""
-            med_b = "済" if int(r.get("med_bed") or 0) == 1 else ""
-
-            note = (r.get("note") or "").strip()
-            note_short = note[:60] + ("…" if len(note) > 60 else "")
-
-            rows.append(
-                {
-                    "日付": str(r.get("record_date") or ""),
-                    "時刻": t,
-                    "ユニット": unit_name,
-                    "利用者": rname,
-                    "区分": kubun,
-                    "病名": disease,
-                    "バイタル(朝) [体温/血圧/脈拍/SpO2]": am_v,
-                    "バイタル(夕) [体温/血圧/脈拍/SpO2]": pm_v,
-                    "食事(朝)": bf,
-                    "食事(昼)": lu,
-                    "食事(夕)": di,
-                    "服薬(朝)": med_m,
-                    "服薬(昼)": med_n,
-                    "服薬(夕)": med_e,
-                    "服薬(寝る前)": med_b,
-                    "特記事項(要約)": note_short,
-                    "記録者": who,
-                }
-            )
-
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-    # 日付→時刻で昇順
-    out["_k"] = out["日付"].astype(str) + " " + out["時刻"].replace({"--:--": "99:99"})
-    out = out.sort_values("_k").drop(columns=["_k"]).reset_index(drop=True)
-    return out
 
 
 # -------------------------
@@ -840,21 +771,16 @@ def show_toast_if_needed():
 # CSS (Mobile First)
 # -------------------------
 def inject_css(is_alert: bool):
-    danger = "#e11d48"
+    danger = "#e11d48"  # vivid red
     accent = "#2563eb"
-    ok = "#16a34a"
-    warn = "#f59e0b"
     btn = danger if is_alert else accent
     title = danger if is_alert else "#0f172a"
-
     st.markdown(
         f"""
 <style>
 :root {{
   --danger: {danger};
   --accent: {accent};
-  --ok: {ok};
-  --warn: {warn};
   --btn: {btn};
   --title: {title};
   --card:#ffffff;
@@ -867,6 +793,7 @@ def inject_css(is_alert: bool):
 .stApp {{ background: var(--bg); color: var(--text); }}
 .block-container {{ padding-top: .8rem; padding-bottom: 2.2rem; max-width: 1100px; }}
 
+/* Title: never clipped */
 .app-title {{
   font-size: 20px;
   font-weight: 900;
@@ -881,6 +808,7 @@ def inject_css(is_alert: bool):
   margin-bottom: .6rem;
 }}
 
+/* Card */
 .card {{
   background: var(--card);
   border: 1px solid var(--border);
@@ -903,11 +831,13 @@ def inject_css(is_alert: bool):
   margin: 0 0 10px 0;
 }}
 
+/* Inputs / labels bigger for mobile */
 label, .stMarkdown, .stTextInput, .stSelectbox, .stTextArea, .stNumberInput, .stToggle, .stCheckbox {{
   font-size: 16px !important;
 }}
 textarea {{ border-radius: 14px !important; }}
 
+/* Buttons: large & easy tap */
 .stButton > button {{
   width: 100%;
   border-radius: 14px !important;
@@ -938,96 +868,14 @@ textarea {{ border-radius: 14px !important; }}
   font-size: 12px;
   font-weight: 900;
 }}
-
 .note-alert {{
   color: var(--danger);
   font-weight: 1000;
-}}
-
-/* status pills */
-.pill {{
-  display:inline-block;
-  padding: 3px 8px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  font-size: 12px;
-  font-weight: 900;
-  margin-right: 6px;
-}}
-.pill.ok {{
-  background: rgba(22,163,74,0.12);
-  color: var(--ok);
-}}
-.pill.ng {{
-  background: rgba(225,29,72,0.10);
-  color: var(--danger);
-}}
-.pill.warn {{
-  background: rgba(245,158,11,0.12);
-  color: var(--warn);
-}}
-
-.grid {{
-  display: grid;
-  grid-template-columns: repeat(1, 1fr);
-  gap: 10px;
-}}
-@media (min-width: 860px) {{
-  .grid {{
-    grid-template-columns: repeat(2, 1fr);
-  }}
-}}
-.small {{
-  font-size: 12px;
-  color: var(--muted);
 }}
 </style>
         """,
         unsafe_allow_html=True,
     )
-
-
-# -------------------------
-# New: daily status summary
-# -------------------------
-def get_daily_status_map(conn, unit_id: int, target_date: str) -> pd.DataFrame:
-    """
-    当日(unit_id, target_date)の各利用者の「実施状況」を集計。
-    その日複数レコードがある場合は、以下を「その日の状態」として見る：
-      - バイタル：該当フィールドが1つでも非NULLなら済
-      - 食事：*_done が1のレコードがあれば済（scoreは最大値採用）
-      - 服薬：該当フラグが1のレコードがあれば済
-    """
-    df = fetch_df(
-        conn,
-        """
-        SELECT r.resident_id,
-               MAX(CASE WHEN temp_am IS NOT NULL OR bp_sys_am IS NOT NULL OR bp_dia_am IS NOT NULL OR pulse_am IS NOT NULL OR spo2_am IS NOT NULL THEN 1 ELSE 0 END) AS vit_am_done,
-               MAX(temp_am) AS temp_am,
-               MAX(CASE WHEN temp_pm IS NOT NULL OR bp_sys_pm IS NOT NULL OR bp_dia_pm IS NOT NULL OR pulse_pm IS NOT NULL OR spo2_pm IS NOT NULL THEN 1 ELSE 0 END) AS vit_pm_done,
-               MAX(temp_pm) AS temp_pm,
-
-               MAX(meal_bf_done) AS meal_bf_done,
-               MAX(meal_bf_score) AS meal_bf_score,
-               MAX(meal_lu_done) AS meal_lu_done,
-               MAX(meal_lu_score) AS meal_lu_score,
-               MAX(meal_di_done) AS meal_di_done,
-               MAX(meal_di_score) AS meal_di_score,
-
-               MAX(med_morning) AS med_morning,
-               MAX(med_noon) AS med_noon,
-               MAX(med_evening) AS med_evening,
-               MAX(med_bed) AS med_bed
-
-          FROM daily_records r
-         WHERE r.unit_id=?
-           AND r.record_date=?
-           AND r.is_deleted=0
-         GROUP BY r.resident_id
-        """,
-        (unit_id, target_date),
-    )
-    return df
 
 
 # -------------------------
@@ -1040,6 +888,7 @@ def main():
     conn = get_conn()
     init_db(conn)
 
+    # Sidebar: minimum
     st.sidebar.title("📌 条件")
     units_df = fetch_df(conn, "SELECT id, name FROM units WHERE is_active=1 ORDER BY id;")
     unit_name = st.sidebar.selectbox("ユニット", units_df["name"].tolist(), index=0)
@@ -1054,6 +903,7 @@ def main():
     recorder_name = st.sidebar.text_input("記録者名（必須）", value=st.session_state.get("recorder_name", ""))
     st.session_state["recorder_name"] = recorder_name
 
+    # Backup (全データCSV)
     with st.sidebar.expander("🧯 全データのバックアップ（CSV）", expanded=False):
         st.caption("万が一に備えて、全テーブルをzipで保存できます。")
         if st.button("📦 バックアップZIPを作成", use_container_width=True, key="mk_backup_zip"):
@@ -1096,6 +946,7 @@ def main():
     disease = (str(sel_row.get("disease") or "")).strip() or "-"
     resident_meta = f"区分：{kubun} / 病名：{disease}"
 
+    # 利用者マスタ（区分・症名）編集
     with st.sidebar.expander("👤 利用者情報（区分・症名）", expanded=False):
         k_key = f"edit_kubun_{resident_id}"
         d_key = f"edit_disease_{resident_id}"
@@ -1106,26 +957,27 @@ def main():
             st.success("✅ 利用者情報を保存しました")
             st.rerun()
 
+    # ----- alert state (⑥の入力中判定) -----
     note_preview = (st.session_state.get(add_key("note"), "") or "").strip()
     special_flag_preview = bool(st.session_state.get(add_key("special_flag"), False))
     is_alert = special_flag_preview or (len(note_preview) > 0)
 
     inject_css(is_alert)
 
-    st.markdown('<div class="app-title">🧾 介護記録</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="app-title">🧾 介護記録</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="app-sub">{unit_name} / {target_date_str} / {sel_name}（{resident_meta}）</div>', unsafe_allow_html=True)
     show_toast_if_needed()
 
-    tab_in, tab_status, tab_list, tab_ho, tab_print = st.tabs(
-        ["✍️ 入力", "📊 実施状況", "📋 経過一覧", "🗒️ 申し送り", "🖨️ 印刷用出力（週報）"]
-    )
+    tab_in, tab_list, tab_ho, tab_print = st.tabs(["✍️ 入力", "📋 経過一覧", "🗒️ 申し送り", "🖨️ 印刷用出力（週報）"])
 
     # -------------------------
     # 入力
     # -------------------------
     with tab_in:
+        # Save button top
         save_top = st.button("💾 保存して記録を追加", use_container_width=True, key=add_key("save_top"))
 
+        # --- 主時刻（自動）: 巡視があれば最新、なければ現在時刻（5分丸め）
         hh_options = ["未選択"] + list(range(0, 24))
         mm_options = ["未選択"] + list(range(0, 60, 5))
 
@@ -1137,6 +989,7 @@ def main():
             except Exception:
                 return None
 
+        # session_state から巡視の入力を先読み（順番が①→⑤でもOK）
         p1 = _patrol_time(st.session_state.get(add_key("p1_hh"), "未選択"), st.session_state.get(add_key("p1_mm"), "未選択"))
         p2 = _patrol_time(st.session_state.get(add_key("p2_hh"), "未選択"), st.session_state.get(add_key("p2_mm"), "未選択"))
         patrol_times = [t for t in [p1, p2] if t]
@@ -1146,6 +999,7 @@ def main():
         auto_hh, auto_mm = (patrol_main if patrol_main else (default_dt.hour, default_dt.minute))
         auto_time_label = fmt_time(auto_hh, auto_mm) + ("（巡視から自動）" if patrol_main else "（現在時刻 自動）")
 
+        # Optional manual override (normally off)
         manual_time = st.toggle("時刻を手動で変更する（通常は不要）", value=False, key=add_key("manual_time"))
         if manual_time:
             t = st.time_input("主時刻（手動）", value=dtime(hour=int(auto_hh), minute=int(auto_mm)), key=add_key("manual_time_val"))
@@ -1155,6 +1009,7 @@ def main():
             main_hh, main_mm = int(auto_hh), int(auto_mm)
             time_label = auto_time_label
 
+        # ① 支援記録
         st.markdown('<div class="card">', unsafe_allow_html=True)
         hcls = "h danger" if is_alert else "h"
         st.markdown(f'<div class="{hcls}">① 支援記録</div>', unsafe_allow_html=True)
@@ -1162,24 +1017,17 @@ def main():
 
         scene = st.selectbox("場面", SCENES, index=2, format_func=scene_display, key=add_key("scene"))
         if str(scene) != "":
-            scene_note = st.text_input(
-                "記録内容（フリーワード）",
-                value="",
-                key=add_key("scene_note"),
-                placeholder="例：表情良好／声かけで落ち着く／水分摂取 等",
-            )
+            scene_note = st.text_input("記録内容（フリーワード）", value="", key=add_key("scene_note"),
+                                       placeholder="例：表情良好／声かけで落ち着く／水分摂取 等")
         else:
             scene_note = ""
             st.caption("※ 場面を選択すると、フリーワード入力欄が表示されます。")
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # ② バイタル（デフォルト値保存）
+        # ② バイタル
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown('<div class="h">② バイタル（朝・夕）</div>', unsafe_allow_html=True)
-        st.markdown(
-            "<div class='p'>※ 朝/夕の「記録する」をONにした場合、空欄でもデフォルト値（体温36.0・血圧120/80・脈拍70・SpO₂98）で安全に保存します。</div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown('<div class="p">※デフォルトは未入力。入力して保存した項目のみ記録されます（空欄は保存しません）。</div>', unsafe_allow_html=True)
 
         latest = latest_vitals_anyday(conn, resident_id)
 
@@ -1199,18 +1047,18 @@ def main():
         st.markdown("**朝**")
         am_rec = st.toggle("朝バイタルを記録する", value=False, key=add_key("am_rec"))
         am_temp_s = st.text_input("体温（℃）", value="", placeholder=ph_float("temp_am"), disabled=(not am_rec), key=add_key("am_temp_s"))
-        am_sys_s = st.text_input("血圧 上", value="", placeholder=ph_int("bp_sys_am"), disabled=(not am_rec), key=add_key("am_sys_s"))
-        am_dia_s = st.text_input("血圧 下", value="", placeholder=ph_int("bp_dia_am"), disabled=(not am_rec), key=add_key("am_dia_s"))
+        am_sys_s  = st.text_input("血圧 上", value="", placeholder=ph_int("bp_sys_am"), disabled=(not am_rec), key=add_key("am_sys_s"))
+        am_dia_s  = st.text_input("血圧 下", value="", placeholder=ph_int("bp_dia_am"), disabled=(not am_rec), key=add_key("am_dia_s"))
         am_pulse_s = st.text_input("脈拍", value="", placeholder=ph_int("pulse_am"), disabled=(not am_rec), key=add_key("am_pulse_s"))
-        am_spo2_s = st.text_input("SpO₂", value="", placeholder=ph_int("spo2_am"), disabled=(not am_rec), key=add_key("am_spo2_s"))
+        am_spo2_s  = st.text_input("SpO₂", value="", placeholder=ph_int("spo2_am"), disabled=(not am_rec), key=add_key("am_spo2_s"))
 
         st.markdown("**夕**")
         pm_rec = st.toggle("夕バイタルを記録する", value=False, key=add_key("pm_rec"))
         pm_temp_s = st.text_input("体温（℃） ", value="", placeholder=ph_float("temp_pm"), disabled=(not pm_rec), key=add_key("pm_temp_s"))
-        pm_sys_s = st.text_input("血圧 上 ", value="", placeholder=ph_int("bp_sys_pm"), disabled=(not pm_rec), key=add_key("pm_sys_s"))
-        pm_dia_s = st.text_input("血圧 下 ", value="", placeholder=ph_int("bp_dia_pm"), disabled=(not pm_rec), key=add_key("pm_dia_s"))
+        pm_sys_s  = st.text_input("血圧 上 ", value="", placeholder=ph_int("bp_sys_pm"), disabled=(not pm_rec), key=add_key("pm_sys_s"))
+        pm_dia_s  = st.text_input("血圧 下 ", value="", placeholder=ph_int("bp_dia_pm"), disabled=(not pm_rec), key=add_key("pm_dia_s"))
         pm_pulse_s = st.text_input("脈拍 ", value="", placeholder=ph_int("pulse_pm"), disabled=(not pm_rec), key=add_key("pm_pulse_s"))
-        pm_spo2_s = st.text_input("SpO₂ ", value="", placeholder=ph_int("spo2_pm"), disabled=(not pm_rec), key=add_key("pm_spo2_s"))
+        pm_spo2_s  = st.text_input("SpO₂ ", value="", placeholder=ph_int("spo2_pm"), disabled=(not pm_rec), key=add_key("pm_spo2_s"))
 
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1305,15 +1153,11 @@ def main():
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown('<div class="h">⑥ 特記事項</div>', unsafe_allow_html=True)
         special_flag = st.checkbox("⚠ 特記事項あり（申し送りにも共有する）", value=False, key=add_key("special_flag"))
-        note = st.text_area(
-            "特記事項（自由記述）",
-            value="",
-            height=200,
-            key=add_key("note"),
-            placeholder="例：普段と違う行動／不穏の兆候／転倒・ヒヤリハット／対応内容と結果 等",
-        )
+        note = st.text_area("特記事項（自由記述）", value="", height=200, key=add_key("note"),
+                            placeholder="例：普段と違う行動／不穏の兆候／転倒・ヒヤリハット／対応内容と結果 等")
         st.markdown("</div>", unsafe_allow_html=True)
 
+        # Save button bottom
         save_bottom = st.button("💾 保存して記録を追加", use_container_width=True, key=add_key("save_bottom"))
 
         # ---- Save action
@@ -1335,26 +1179,18 @@ def main():
                 else:
                     main_hh2, main_mm2 = main_hh, main_mm
 
-                # --- Vitals: if ON then use default when blank ---
-                def vital_float_or_default(txt, default):
-                    v = parse_float_str(txt)
-                    return default if v is None else v
+                # Vitals: default blank -> None（入力した項目だけ保存）
+                am_temp_v = parse_float_str(am_temp_s) if bool(am_rec) else None
+                am_sys_v = parse_int_str(am_sys_s) if bool(am_rec) else None
+                am_dia_v = parse_int_str(am_dia_s) if bool(am_rec) else None
+                am_pulse_v = parse_int_str(am_pulse_s) if bool(am_rec) else None
+                am_spo2_v = parse_int_str(am_spo2_s) if bool(am_rec) else None
 
-                def vital_int_or_default(txt, default):
-                    v = parse_int_str(txt)
-                    return default if v is None else v
-
-                am_temp_v = vital_float_or_default(am_temp_s, VITAL_DEFAULTS["temp"]) if bool(am_rec) else None
-                am_sys_v = vital_int_or_default(am_sys_s, VITAL_DEFAULTS["bp_sys"]) if bool(am_rec) else None
-                am_dia_v = vital_int_or_default(am_dia_s, VITAL_DEFAULTS["bp_dia"]) if bool(am_rec) else None
-                am_pulse_v = vital_int_or_default(am_pulse_s, VITAL_DEFAULTS["pulse"]) if bool(am_rec) else None
-                am_spo2_v = vital_int_or_default(am_spo2_s, VITAL_DEFAULTS["spo2"]) if bool(am_rec) else None
-
-                pm_temp_v = vital_float_or_default(pm_temp_s, VITAL_DEFAULTS["temp"]) if bool(pm_rec) else None
-                pm_sys_v = vital_int_or_default(pm_sys_s, VITAL_DEFAULTS["bp_sys"]) if bool(pm_rec) else None
-                pm_dia_v = vital_int_or_default(pm_dia_s, VITAL_DEFAULTS["bp_dia"]) if bool(pm_rec) else None
-                pm_pulse_v = vital_int_or_default(pm_pulse_s, VITAL_DEFAULTS["pulse"]) if bool(pm_rec) else None
-                pm_spo2_v = vital_int_or_default(pm_spo2_s, VITAL_DEFAULTS["spo2"]) if bool(pm_rec) else None
+                pm_temp_v = parse_float_str(pm_temp_s) if bool(pm_rec) else None
+                pm_sys_v = parse_int_str(pm_sys_s) if bool(pm_rec) else None
+                pm_dia_v = parse_int_str(pm_dia_s) if bool(pm_rec) else None
+                pm_pulse_v = parse_int_str(pm_pulse_s) if bool(pm_rec) else None
+                pm_spo2_v = parse_int_str(pm_spo2_s) if bool(pm_rec) else None
 
                 wakeup_flag = 1 if str(scene) == "起床" else 0
 
@@ -1403,6 +1239,7 @@ def main():
                     st.error(f"DBエラー: {e}")
                     st.stop()
 
+                # 特記事項 → 申し送り（チェックONかつ内容あり）
                 if bool(special_flag) and (payload["note"] or "").strip():
                     add_handover_from_note(
                         conn,
@@ -1415,97 +1252,6 @@ def main():
                     )
 
                 bump_epoch_and_rerun()
-
-    # -------------------------
-    # 📊 実施状況（カード型）
-    # -------------------------
-    with tab_status:
-        st.markdown("### 📊 本日の実施状況（カード型）")
-        st.caption("全利用者の当日状況（バイタル／食事／服薬）を一目で確認できます。")
-
-        status_df = get_daily_status_map(conn, unit_id, target_date_str)
-        status_map = {int(r["resident_id"]): r for _, r in status_df.iterrows()} if not status_df.empty else {}
-
-        st.markdown('<div class="grid">', unsafe_allow_html=True)
-        for _, rr in residents_df.iterrows():
-            rid = int(rr["id"])
-            name = str(rr["name"])
-            kubun = (str(rr.get("kubun") or "")).strip() or "-"
-            disease = (str(rr.get("disease") or "")).strip() or "-"
-
-            s = status_map.get(rid, None)
-
-            vit_am_done = int(s["vit_am_done"]) == 1 if s is not None else False
-            vit_pm_done = int(s["vit_pm_done"]) == 1 if s is not None else False
-            temp_am = safe_float(s["temp_am"]) if s is not None else None
-            temp_pm = safe_float(s["temp_pm"]) if s is not None else None
-
-            meal_bf_done = int(s["meal_bf_done"]) == 1 if s is not None else False
-            meal_lu_done = int(s["meal_lu_done"]) == 1 if s is not None else False
-            meal_di_done = int(s["meal_di_done"]) == 1 if s is not None else False
-            meal_bf_score = int(s["meal_bf_score"] or 0) if s is not None else 0
-            meal_lu_score = int(s["meal_lu_score"] or 0) if s is not None else 0
-            meal_di_score = int(s["meal_di_score"] or 0) if s is not None else 0
-
-            med_m = int(s["med_morning"]) == 1 if s is not None else False
-            med_n = int(s["med_noon"]) == 1 if s is not None else False
-            med_e = int(s["med_evening"]) == 1 if s is not None else False
-            med_b = int(s["med_bed"]) == 1 if s is not None else False
-
-            def pill(ok_flag, label_ok="✅", label_ng="ー"):
-                if ok_flag:
-                    return f"<span class='pill ok'>{label_ok}</span>"
-                return f"<span class='pill ng'>{label_ng}</span>"
-
-            vit_am_txt = f"{temp_am:.1f}℃" if (vit_am_done and temp_am is not None) else "ー"
-            vit_pm_txt = f"{temp_pm:.1f}℃" if (vit_pm_done and temp_pm is not None) else "ー"
-
-            bf_txt = f"{meal_bf_score}/10" if meal_bf_done else "ー"
-            lu_txt = f"{meal_lu_score}/10" if meal_lu_done else "ー"
-            di_txt = f"{meal_di_score}/10" if meal_di_done else "ー"
-
-            # 完了率（目安）
-            done_count = sum([vit_am_done, vit_pm_done, meal_bf_done, meal_lu_done, meal_di_done, med_m, med_n, med_e, med_b])
-            total = 9
-            if done_count == total:
-                head = "<span class='pill ok'>完了</span>"
-            elif done_count >= 6:
-                head = "<span class='pill warn'>あと少し</span>"
-            else:
-                head = "<span class='pill ng'>未完了多</span>"
-
-            st.markdown(
-                f"""
-<div class="card">
-  <div style="display:flex;justify-content:space-between;align-items:center;">
-    <div style="font-weight:1000;font-size:16px;">{name}</div>
-    <div>{head}</div>
-  </div>
-  <div class="small">区分:{kubun} / 病名:{disease}</div>
-  <hr style="border:none;border-top:1px solid rgba(15,23,42,0.10);margin:10px 0;">
-  <div style="font-weight:900;margin-bottom:6px;">バイタル</div>
-  <div>朝 {pill(vit_am_done, '✅ ' + vit_am_txt, 'ー')}</div>
-  <div>夕 {pill(vit_pm_done, '✅ ' + vit_pm_txt, 'ー')}</div>
-
-  <div style="font-weight:900;margin:10px 0 6px;">食事</div>
-  <div>朝 {pill(meal_bf_done, '✅ ' + bf_txt, 'ー')}</div>
-  <div>昼 {pill(meal_lu_done, '✅ ' + lu_txt, 'ー')}</div>
-  <div>夕 {pill(meal_di_done, '✅ ' + di_txt, 'ー')}</div>
-
-  <div style="font-weight:900;margin:10px 0 6px;">服薬</div>
-  <div>朝 {pill(med_m, '✅ 済', 'ー')}</div>
-  <div>昼 {pill(med_n, '✅ 済', 'ー')}</div>
-  <div>夕 {pill(med_e, '✅ 済', 'ー')}</div>
-  <div>寝 {pill(med_b, '✅ 済', 'ー')}</div>
-
-  <div class="small" style="margin-top:10px;">完了 {done_count}/{total}</div>
-</div>
-                """,
-                unsafe_allow_html=True,
-            )
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        st.caption("※ 実施状況は当日の全記録を集計して表示します（複数回入力がある場合は“済”を優先）。")
 
     # -------------------------
     # 経過一覧
@@ -1530,12 +1276,14 @@ def main():
                 st.markdown(f"**{t}** 　<span class='badge'>{scene}</span> 　記録者：{r.get('recorder_name')}", unsafe_allow_html=True)
                 st.markdown(f"<div class='meta'>作成:{created_at} / 更新:{updated_at} / 巡視:{patrol_count}回</div>", unsafe_allow_html=True)
 
+                # --- ① 支援記録（場面メモ） ---
                 sn = (r.get("scene_note") or "").strip()
                 if sn:
                     st.markdown(f"- 【場面メモ】{sn}")
                 else:
                     st.caption("【場面メモ】なし")
 
+                # --- ② バイタル（朝・夕） ---
                 def _v(v, fmt=None):
                     if v is None:
                         return None
@@ -1575,6 +1323,7 @@ def main():
                 st.markdown(f"- {_vline('バイタル（朝）', am)}")
                 st.markdown(f"- {_vline('バイタル（夕）', pm)}")
 
+                # --- ③ 食事 ---
                 bf_done0 = int(r.get("meal_bf_done") or 0)
                 lu_done0 = int(r.get("meal_lu_done") or 0)
                 di_done0 = int(r.get("meal_di_done") or 0)
@@ -1587,20 +1336,18 @@ def main():
                 else:
                     st.caption("【食事】記録なし")
 
+                # --- ④ 服薬 ---
                 meds = []
-                if int(r.get("med_morning") or 0) == 1:
-                    meds.append("朝")
-                if int(r.get("med_noon") or 0) == 1:
-                    meds.append("昼")
-                if int(r.get("med_evening") or 0) == 1:
-                    meds.append("夕")
-                if int(r.get("med_bed") or 0) == 1:
-                    meds.append("寝る前")
+                if int(r.get("med_morning") or 0) == 1: meds.append("朝")
+                if int(r.get("med_noon") or 0) == 1: meds.append("昼")
+                if int(r.get("med_evening") or 0) == 1: meds.append("夕")
+                if int(r.get("med_bed") or 0) == 1: meds.append("寝る前")
                 if meds:
                     st.markdown("- 【服薬】" + " / ".join(meds))
                 else:
                     st.caption("【服薬】記録なし")
 
+                # --- ⑤ 巡視 ---
                 if patrol_count > 0:
                     pat = load_patrols(conn, rid)
                     st.markdown("**【巡視】**")
@@ -1621,6 +1368,7 @@ def main():
                 else:
                     st.caption("【巡視】記録なし")
 
+                # --- ⑥ 特記事項（赤） ---
                 note_head = (r.get("note_head") or "").strip()
                 if note_head:
                     st.markdown(f"<div class='note-alert'>【特記事項】{note_head}</div>", unsafe_allow_html=True)
@@ -1639,15 +1387,11 @@ def main():
         st.markdown("### 🗒️ 申し送り（連絡帳）")
         st.caption("⑥特記事項（チェックONで保存）→ここに自動反映。リアクションは 👍 のみ。")
 
+        # 新規申し送り（自由記述）
         st.markdown("#### ➕ 新規申し送り作成")
         st.caption("特記事項以外の連絡も、ここから直接投稿できます。")
-        ho_scope = st.radio(
-            "対象",
-            ["この利用者", "全体（ユニット）"],
-            horizontal=True,
-            index=0,
-            key=f"ho_scope_{unit_id}_{resident_id}_{target_date_str}",
-        )
+        ho_scope = st.radio("対象", ["この利用者", "全体（ユニット）"], horizontal=True, index=0,
+                            key=f"ho_scope_{unit_id}_{resident_id}_{target_date_str}")
         ho_text = st.text_area(
             "申し送り内容（自由記述）",
             value="",
@@ -1723,7 +1467,7 @@ def main():
     # -------------------------
     with tab_print:
         st.markdown("### 🖨️ 印刷用出力（週報）")
-        st.caption("PCでの印刷・行政提出を想定した表示です。")
+        st.caption("PCでの印刷・行政提出を想定した表示です。入力のしやすさ（スマホ）は維持します。")
 
         def _r_label(row):
             k = (str(row.get("kubun") or "")).strip() or "-"
@@ -1737,7 +1481,7 @@ def main():
                 cur_idx = i
                 break
 
-        sel_rr2 = st.selectbox("利用者（週報対象：タイムライン）", options=r_opts2, index=cur_idx, format_func=_r_label, key="print_resident")
+        sel_rr2 = st.selectbox("利用者（週報対象）", options=r_opts2, index=cur_idx, format_func=_r_label, key="print_resident")
         pr_resident_id = int(sel_rr2["id"])
         pr_name = str(sel_rr2["name"])
         pr_kubun = (str(sel_rr2.get("kubun") or "")).strip() or "-"
@@ -1751,46 +1495,34 @@ def main():
         st.markdown(f"**ユニット：{unit_name} / 利用者：{pr_name}（区分:{pr_kubun} / 病名:{pr_disease}）**")
         st.markdown(f"期間：{start_s} 〜 {end_s}（7日間）")
 
-        st.divider()
-        st.markdown("#### ① 時系列（従来のタイムライン形式）")
         df_week = build_week_timeline(conn, pr_resident_id, start_s, end_s)
         if df_week.empty:
             st.info("この期間の記録はありません。")
         else:
-            st.dataframe(df_week, use_container_width=True, height=420)
+            st.dataframe(df_week, use_container_width=True, height=520)
 
-        st.divider()
-        st.markdown("#### ② 行政提出向け（列型の週報テーブル）")
-        df_submit = build_week_table_for_submission(conn, residents_df, unit_name, start_s, end_s)
-        if df_submit.empty:
-            st.info("この期間の記録はありません（列型）。")
-        else:
-            st.dataframe(df_submit, use_container_width=True, height=520)
-
-            csv_bytes = df_submit.to_csv(index=False).encode("utf-8-sig")
+            csv_bytes = df_week.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "⬇️ CSVダウンロード（列型）",
+                "⬇️ CSVダウンロード",
                 data=csv_bytes,
-                file_name=f"weekly_submit_{unit_name}_{start_s}_to_{end_s}.csv",
+                file_name=f"weekly_{unit_name}_{pr_name}_{start_s}_to_{end_s}.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
 
             xbio = BytesIO()
             with pd.ExcelWriter(xbio, engine="openpyxl") as writer:
-                df_submit.to_excel(writer, index=False, sheet_name="週報_列型")
-                if not df_week.empty:
-                    df_week.to_excel(writer, index=False, sheet_name="週報_時系列")
+                df_week.to_excel(writer, index=False, sheet_name="週報")
             st.download_button(
-                "⬇️ Excelダウンロード（列型＋時系列）",
+                "⬇️ Excelダウンロード",
                 data=xbio.getvalue(),
-                file_name=f"weekly_submit_{unit_name}_{start_s}_to_{end_s}.xlsx",
+                file_name=f"weekly_{unit_name}_{pr_name}_{start_s}_to_{end_s}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
 
-        st.markdown("#### 印刷（PC）")
-        st.caption("ブラウザの印刷機能（Ctrl+P / ⌘P）で印刷してください。")
+            st.markdown("#### 印刷（PC）")
+            st.caption("ブラウザの印刷機能（Ctrl+P / ⌘P）で印刷してください。表は提出向けに時系列で並びます。")
 
     conn.close()
 
