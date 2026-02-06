@@ -21,12 +21,15 @@
 import os
 import sqlite3
 from pathlib import Path
-from datetime import date, datetime, time as dtime
+from datetime import date, datetime, time as dtime, timezone, timedelta
 
 import pandas as pd
 import streamlit as st
 
 
+
+# --- Timezone (JST) ---
+JST = timezone(timedelta(hours=9))
 # -------------------------
 # Paths / DB
 # -------------------------
@@ -71,7 +74,7 @@ def exec_sql(conn, sql, params=()):
 
 
 def now_iso():
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(JST).isoformat(timespec="seconds")
 
 
 def get_table_cols(conn, table: str) -> set:
@@ -83,6 +86,17 @@ def ensure_column(conn, table: str, col: str, col_def_sql: str):
     cols = get_table_cols(conn, table)
     if col not in cols:
         exec_sql(conn, f"ALTER TABLE {table} ADD COLUMN {col_def_sql};")
+
+
+def update_resident_master(conn, *, resident_id: int, kubun: str, disease: str):
+    """利用者マスタ（区分・症名）を更新する。列が無い場合も安全に追加してから更新する。"""
+    ensure_column(conn, "residents", "kubun", "kubun TEXT")
+    ensure_column(conn, "residents", "disease", "disease TEXT")
+    exec_sql(
+        conn,
+        "UPDATE residents SET kubun=?, disease=? WHERE id=?",
+        ((kubun or "").strip(), (disease or "").strip(), int(resident_id)),
+    )
 
 
 def init_db(conn):
@@ -307,7 +321,7 @@ def fmt_time(hh, mm) -> str:
 
 
 def round_now_5min():
-    now = datetime.now()
+    now = datetime.now(JST)
     minute = (now.minute // 5) * 5
     return now.replace(minute=minute, second=0, microsecond=0)
 
@@ -675,7 +689,7 @@ def main():
     unit_name = st.sidebar.selectbox("ユニット", units_df["name"].tolist(), index=0)
     unit_id = int(units_df.loc[units_df["name"] == unit_name, "id"].iloc[0])
 
-    target_date = st.sidebar.date_input("日付", value=date.today())
+    target_date = st.sidebar.date_input("日付", value=datetime.now(JST).date())
     target_date_str = target_date.isoformat()
 
     shift = st.sidebar.radio("勤務区分", ["日勤", "夜勤"], index=0)
@@ -702,6 +716,19 @@ def main():
     kubun = (str(sel_row.get("kubun") or "")).strip() or "-"
     disease = (str(sel_row.get("disease") or "")).strip() or "-"
     resident_meta = f"区分：{kubun} / 病名：{disease}"
+
+
+    # 利用者マスタ（区分・症名）編集
+    with st.sidebar.expander("👤 利用者情報（区分・症名）", expanded=False):
+        k_key = f"edit_kubun_{resident_id}"
+        d_key = f"edit_disease_{resident_id}"
+        kubun_in = st.text_input("区分（障害支援区分）", value=(str(sel_row.get("kubun") or "")).strip(), key=k_key)
+        disease_in = st.text_input("症名（診断名）", value=(str(sel_row.get("disease") or "")).strip(), key=d_key)
+        if st.button("💾 利用者情報を保存", use_container_width=True, key=f"save_resident_{resident_id}"):
+            update_resident_master(conn, resident_id=resident_id, kubun=kubun_in, disease=disease_in)
+            st.success("✅ 利用者情報を保存しました")
+            st.rerun()
+
 
     # ----- alert state (⑥の入力中判定) -----
     note_preview = (st.session_state.get(add_key("note"), "") or "").strip()
@@ -1024,15 +1051,105 @@ def main():
                 st.markdown(f"**{t}** 　<span class='badge'>{scene}</span> 　記録者：{r.get('recorder_name')}", unsafe_allow_html=True)
                 st.markdown(f"<div class='meta'>作成:{created_at} / 更新:{updated_at} / 巡視:{patrol_count}回</div>", unsafe_allow_html=True)
 
+
+                # --- ① 支援記録（場面メモ） ---
                 sn = (r.get("scene_note") or "").strip()
                 if sn:
-                    st.markdown(f"- 場面メモ：{sn}")
+                    st.markdown(f"- 【場面メモ】{sn}")
+                else:
+                    st.caption("【場面メモ】なし")
 
+                # --- ② バイタル（朝・夕） ---
+                def _v(v, fmt=None):
+                    if v is None:
+                        return None
+                    try:
+                        if pd.isna(v):
+                            return None
+                    except Exception:
+                        pass
+                    return fmt(v) if fmt else v
+
+                am = {
+                    "体温": _v(safe_float(r.get("temp_am")), lambda x: f"{x:.1f}℃"),
+                    "血圧": None,
+                    "脈拍": _v(safe_int(r.get("pulse_am")), lambda x: f"{x}"),
+                    "SpO2": _v(safe_int(r.get("spo2_am")), lambda x: f"{x}%"),
+                }
+                sys_am = safe_int(r.get("bp_sys_am"))
+                dia_am = safe_int(r.get("bp_dia_am"))
+                if sys_am is not None or dia_am is not None:
+                    am["血圧"] = f"{sys_am if sys_am is not None else '--'}/{dia_am if dia_am is not None else '--'}"
+
+                pm = {
+                    "体温": _v(safe_float(r.get("temp_pm")), lambda x: f"{x:.1f}℃"),
+                    "血圧": None,
+                    "脈拍": _v(safe_int(r.get("pulse_pm")), lambda x: f"{x}"),
+                    "SpO2": _v(safe_int(r.get("spo2_pm")), lambda x: f"{x}%"),
+                }
+                sys_pm = safe_int(r.get("bp_sys_pm"))
+                dia_pm = safe_int(r.get("bp_dia_pm"))
+                if sys_pm is not None or dia_pm is not None:
+                    pm["血圧"] = f"{sys_pm if sys_pm is not None else '--'}/{dia_pm if dia_pm is not None else '--'}"
+
+                def _vline(label, d):
+                    parts = [f"{k}:{v}" for k, v in d.items() if v not in (None, "", "--/--")]
+                    return f"【{label}】" + " / ".join(parts) if parts else f"【{label}】記録なし"
+
+                st.markdown(f"- {_vline('バイタル（朝）', am)}")
+                st.markdown(f"- {_vline('バイタル（夕）', pm)}")
+
+                # --- ③ 食事 ---
+                bf_done0 = int(r.get("meal_bf_done") or 0)
+                lu_done0 = int(r.get("meal_lu_done") or 0)
+                di_done0 = int(r.get("meal_di_done") or 0)
+                meal_parts = []
+                meal_parts.append(f"朝:{int(r.get('meal_bf_score') or 0)}" if bf_done0 else "朝:-")
+                meal_parts.append(f"昼:{int(r.get('meal_lu_score') or 0)}" if lu_done0 else "昼:-")
+                meal_parts.append(f"夕:{int(r.get('meal_di_score') or 0)}" if di_done0 else "夕:-")
+                if bf_done0 or lu_done0 or di_done0:
+                    st.markdown("- 【食事】" + " / ".join(meal_parts))
+                else:
+                    st.caption("【食事】記録なし")
+
+                # --- ④ 服薬 ---
+                meds = []
+                if int(r.get("med_morning") or 0) == 1: meds.append("朝")
+                if int(r.get("med_noon") or 0) == 1: meds.append("昼")
+                if int(r.get("med_evening") or 0) == 1: meds.append("夕")
+                if int(r.get("med_bed") or 0) == 1: meds.append("寝る前")
+                if meds:
+                    st.markdown("- 【服薬】" + " / ".join(meds))
+                else:
+                    st.caption("【服薬】記録なし")
+
+                # --- ⑤ 巡視 ---
+                if patrol_count > 0:
+                    pat = load_patrols(conn, rid)
+                    st.markdown("**【巡視】**")
+                    for _, p in pat.iterrows():
+                        pt = fmt_time(p.get("patrol_time_hh"), p.get("patrol_time_mm"))
+                        status = (p.get("status") or "").strip()
+                        memo = (p.get("memo") or "").strip()
+                        intervened = "対応あり" if int(p.get("intervened") or 0) == 1 else ""
+                        door = "ドア開放" if int(p.get("door_opened") or 0) == 1 else ""
+                        safety = (p.get("safety_checks") or "").strip()
+                        bits = [b for b in [status, safety, intervened, door] if b]
+                        head = f"- 巡視{int(p.get('patrol_no') or 0)} {pt}"
+                        if bits:
+                            head += "（" + " / ".join(bits) + "）"
+                        st.markdown(head)
+                        if memo:
+                            st.markdown(f"  - メモ：{memo}")
+                else:
+                    st.caption("【巡視】記録なし")
+
+                # --- ⑥ 特記事項（赤） ---
                 note_head = (r.get("note_head") or "").strip()
                 if note_head:
-                    st.markdown(f"<div class='note-alert'>特記事項：{note_head}</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='note-alert'>【特記事項】{note_head}</div>", unsafe_allow_html=True)
                 else:
-                    st.caption("特記事項：なし")
+                    st.caption("【特記事項】なし")
 
                 if st.button("削除（論理削除）", key=f"del_{rid}"):
                     soft_delete_record(conn, rid)
@@ -1045,6 +1162,42 @@ def main():
     with tab_ho:
         st.markdown("### 🗒️ 申し送り（連絡帳）")
         st.caption("⑥特記事項（チェックONで保存）→ここに自動反映。リアクションは 👍 のみ。")
+
+
+        # 新規申し送り（自由記述）
+        st.markdown("#### ➕ 新規申し送り作成")
+        st.caption("特記事項以外の連絡も、ここから直接投稿できます。")
+        ho_scope = st.radio("対象", ["この利用者", "全体（ユニット）"], horizontal=True, index=0,
+                            key=f"ho_scope_{unit_id}_{resident_id}_{target_date_str}")
+        ho_text = st.text_area(
+            "申し送り内容（自由記述）",
+            value="",
+            height=140,
+            placeholder="例：明日は通院予定／家族から電話あり／買い物依頼 など",
+            key=f"ho_text_{unit_id}_{resident_id}_{target_date_str}",
+        )
+        if st.button("📮 申し送りを投稿", use_container_width=True, key=f"post_ho_{unit_id}_{resident_id}_{target_date_str}"):
+            if recorder_name.strip() == "":
+                st.error("投稿するには、サイドバーの『記録者名（必須）』を入力してください。")
+            else:
+                content = (ho_text or "").strip()
+                if content == "":
+                    st.error("申し送り内容を入力してください。")
+                else:
+                    add_handover_from_note(
+                        conn,
+                        unit_id=unit_id,
+                        resident_id=(resident_id if ho_scope == "この利用者" else None),
+                        handover_date=target_date_str,
+                        content=content,
+                        created_by=recorder_name.strip(),
+                        source_record_id=None,
+                    )
+                    st.success("✅ 申し送りを投稿しました")
+                    st.rerun()
+
+        st.divider()
+
 
         ho = list_handovers(conn, unit_id=unit_id, handover_date=target_date_str)
         res_map = {int(r["id"]): str(r["name"]) for _, r in residents_df.iterrows()}
