@@ -978,32 +978,6 @@ def main():
                 return std[key]
             return float(v) if as_type == "float" else int(v)
 
-        # ---------------- ① 支援記録 ----------------
-        st.markdown('<div class="record-card">', unsafe_allow_html=True)
-        title_1_cls = "section-title danger" if is_special_typing else "section-title"
-        st.markdown(f'<div class="{title_1_cls}">① 支援記録</div>', unsafe_allow_html=True)
-        st.markdown('<div class="section-sub">時刻は「巡視があれば最新巡視時刻」、なければ「現在時刻」を自動採用します。</div>', unsafe_allow_html=True)
-
-        add_scene = st.selectbox("場面", SCENES, index=2, format_func=scene_display, key=add_key("add_scene"))
-
-        scene_note = ""
-        if str(add_scene) != "":
-            scene_note = st.text_input(
-                "記録内容（フリーワード）",
-                value="",
-                key=add_key("scene_note"),
-                placeholder="例：表情良好／声かけで落ち着く／水分摂取 等",
-            )
-
-        # Optional manual time override
-        now_dt = datetime.now()
-        default_time = now_dt.replace(minute=(now_dt.minute // 5) * 5, second=0, microsecond=0).time()
-        change_time = st.toggle("時刻を手動で変更する（通常は不要）", value=False, key=add_key("manual_time_toggle"))
-        manual_time = None
-        if change_time:
-            manual_time = st.time_input("時刻", value=default_time, key=add_key("manual_time_value"))
-        st.markdown("</div>", unsafe_allow_html=True)
-
         # ---------------- ⑤ 巡視（先に） ----------------
         st.markdown('<div class="record-card">', unsafe_allow_html=True)
         st.markdown('<div class="section-title">⑤ 巡視</div>', unsafe_allow_html=True)
@@ -1087,7 +1061,37 @@ def main():
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # Decide main record time
+        
+
+# ---------------- ① 支援記録 ----------------
+        st.markdown('<div class="record-card">', unsafe_allow_html=True)
+        title_1_cls = "section-title danger" if is_special_typing else "section-title"
+        st.markdown(f'<div class="{title_1_cls}">① 支援記録</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-sub">時刻は「巡視があれば最新巡視時刻」、なければ「現在時刻」を自動採用します。</div>', unsafe_allow_html=True)
+
+        add_scene = st.selectbox("場面", SCENES, index=2, format_func=scene_display, key=add_key("add_scene"))
+
+        scene_note = ""
+        if str(add_scene) != "":
+            scene_note = st.text_input(
+                "記録内容（フリーワード）",
+                value="",
+                key=add_key("scene_note"),
+                placeholder="例：表情良好／声かけで落ち着く／水分摂取 等",
+            )
+
+        # Optional manual time override
+        now_dt = datetime.now()
+        default_time = now_dt.replace(minute=(now_dt.minute // 5) * 5, second=0, microsecond=0).time()
+        change_time = st.toggle("時刻を手動で変更する（通常は不要）", value=False, key=add_key("manual_time_toggle"))
+        manual_time = None
+        if change_time:
+            manual_time = st.time_input("時刻", value=default_time, key=add_key("manual_time_value"))
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        
+
+# Decide main record time
         if enable_patrol and patrol_main_time is not None:
             auto_hh, auto_mm = patrol_main_time
         else:
