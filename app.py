@@ -4,11 +4,13 @@
 # Mobile First / 1カラム最適化版（2026-02）
 #
 # ✅ 追加/修正（今回）
-# 1) バイタル空欄エラー防止＆デフォルト値保存
+# 1) バイタル空欄エラー防止＆初期値（空欄を作らない）
 #    - 体温36.0 / 血圧120/80 / 脈拍70 / SpO2 98
-#    - 朝/夕「記録する」ONなら空欄でもデフォルトで保存
-# 2) 新タブ「📊 実施状況（カード型）」：全利用者の当日実施状況を一覧
-# 3) 週報（印刷用）に「列型の提出向けテーブル」を追加
+#    - 朝/夕「記録する」ONなら必ずDBに保存（初期値のままでもOK）
+# 2) 服薬表記は「OK」に統一（入力・一覧・実施状況・週報）
+# 3) 新タブ「📊 実施状況（カード型）」：全利用者の当日実施状況を一覧
+# 4) 申し送り：投稿ごとに「削除」ボタン（論理削除）
+# 5) 週報（印刷用）：時系列＋行政提出向け（列型）を併記。服薬はOK表記。
 #
 # 既存の「利用者マスタ（区分・病名）」「申し送り自由記述」「いいね」機能は維持。
 # 日本時間（JST）維持。
@@ -306,30 +308,6 @@ def safe_float(x):
         return None
 
 
-def parse_int_str(s: str):
-    if s is None:
-        return None
-    s = str(s).strip()
-    if s == "":
-        return None
-    try:
-        return int(float(s))
-    except Exception:
-        return None
-
-
-def parse_float_str(s: str):
-    if s is None:
-        return None
-    s = str(s).strip()
-    if s == "":
-        return None
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-
 def fmt_dt(s):
     if not s:
         return "--"
@@ -490,6 +468,10 @@ def soft_delete_record(conn, record_id: int):
     exec_sql(conn, "UPDATE daily_records SET is_deleted=1, updated_at=? WHERE id=?", (now_iso(), int(record_id)))
 
 
+def soft_delete_handover(conn, handover_id: int):
+    exec_sql(conn, "UPDATE handovers SET is_deleted=1 WHERE id=?", (int(handover_id),))
+
+
 # -------------------------
 # Export / Weekly report
 # -------------------------
@@ -553,10 +535,12 @@ def build_week_timeline(conn, resident_id: int, start_date: str, end_date: str) 
                 return
             rows.append({"日付": d, "時刻": t, "項目": item, "内容": content, "勤務": shift, "記録者": who})
 
+        # ① 支援記録
         sc = scene_display(r.get("scene"))
         sn = (r.get("scene_note") or "").strip()
         add("①支援記録", f"{sc}：{sn}" if sn else f"{sc}")
 
+        # ② バイタル（朝/夕）
         def vit_line(prefix, temp, sys, dia, pulse, spo2):
             parts = []
             if temp is not None:
@@ -569,15 +553,28 @@ def build_week_timeline(conn, resident_id: int, start_date: str, end_date: str) 
                 parts.append(f"SpO₂ {int(spo2)}%")
             return (prefix + " " + " / ".join(parts)).strip() if parts else ""
 
-        am = vit_line("朝", safe_float(r.get("temp_am")), safe_int(r.get("bp_sys_am")), safe_int(r.get("bp_dia_am")),
-                      safe_int(r.get("pulse_am")), safe_int(r.get("spo2_am")))
-        pm = vit_line("夕", safe_float(r.get("temp_pm")), safe_int(r.get("bp_sys_pm")), safe_int(r.get("bp_dia_pm")),
-                      safe_int(r.get("pulse_pm")), safe_int(r.get("spo2_pm")))
+        am = vit_line(
+            "朝",
+            safe_float(r.get("temp_am")),
+            safe_int(r.get("bp_sys_am")),
+            safe_int(r.get("bp_dia_am")),
+            safe_int(r.get("pulse_am")),
+            safe_int(r.get("spo2_am")),
+        )
+        pm = vit_line(
+            "夕",
+            safe_float(r.get("temp_pm")),
+            safe_int(r.get("bp_sys_pm")),
+            safe_int(r.get("bp_dia_pm")),
+            safe_int(r.get("pulse_pm")),
+            safe_int(r.get("spo2_pm")),
+        )
         if am:
             add("②バイタル", am)
         if pm:
             add("②バイタル", pm)
 
+        # ③ 食事
         meals = []
         if int(r.get("meal_bf_done") or 0) == 1:
             meals.append(f"朝 {int(r.get('meal_bf_score') or 0)}/10")
@@ -588,22 +585,25 @@ def build_week_timeline(conn, resident_id: int, start_date: str, end_date: str) 
         if meals:
             add("③食事", " / ".join(meals))
 
+        # ④ 服薬（OK表記）
         meds = []
         if int(r.get("med_morning") or 0) == 1:
-            meds.append("朝")
+            meds.append("朝OK")
         if int(r.get("med_noon") or 0) == 1:
-            meds.append("昼")
+            meds.append("昼OK")
         if int(r.get("med_evening") or 0) == 1:
-            meds.append("夕")
+            meds.append("夕OK")
         if int(r.get("med_bed") or 0) == 1:
-            meds.append("寝る前")
+            meds.append("寝る前OK")
         if meds:
             add("④服薬", " / ".join(meds))
 
+        # ⑥ 特記事項
         note = (r.get("note") or "").strip()
         if note:
             add("⑥特記事項", note)
 
+        # ⑤ 巡視
         if int(r.get("patrol_count") or 0) > 0:
             pat = load_patrols(conn, rid)
             for _, p in pat.iterrows():
@@ -640,6 +640,7 @@ def build_week_table_for_submission(conn, residents_df: pd.DataFrame, unit_name:
     """
     行政提出を意識した「列型」週報テーブル。
     - 日付・利用者・区分/病名・バイタル/食事/服薬を列に整形
+    - 服薬はOK表記
     """
     rows = []
     for _, rr in residents_df.iterrows():
@@ -656,7 +657,6 @@ def build_week_table_for_submission(conn, residents_df: pd.DataFrame, unit_name:
             t = fmt_time(r.get("record_time_hh"), r.get("record_time_mm"))
             who = str(r.get("recorder_name") or "")
 
-            # vitals
             def vpack(prefix):
                 if prefix == "am":
                     temp = safe_float(r.get("temp_am"))
@@ -670,13 +670,11 @@ def build_week_table_for_submission(conn, residents_df: pd.DataFrame, unit_name:
                     dia = safe_int(r.get("bp_dia_pm"))
                     pulse = safe_int(r.get("pulse_pm"))
                     spo2 = safe_int(r.get("spo2_pm"))
+
                 if temp is None and sys is None and dia is None and pulse is None and spo2 is None:
                     return ""
                 parts = []
-                if temp is not None:
-                    parts.append(f"{temp:.1f}")
-                else:
-                    parts.append("")
+                parts.append(f"{temp:.1f}" if temp is not None else "")
                 bp = ""
                 if sys is not None or dia is not None:
                     bp = f"{sys if sys is not None else '--'}/{dia if dia is not None else '--'}"
@@ -688,16 +686,14 @@ def build_week_table_for_submission(conn, residents_df: pd.DataFrame, unit_name:
             am_v = vpack("am")
             pm_v = vpack("pm")
 
-            # meals
             bf = f"{int(r.get('meal_bf_score') or 0)}/10" if int(r.get("meal_bf_done") or 0) == 1 else ""
             lu = f"{int(r.get('meal_lu_score') or 0)}/10" if int(r.get("meal_lu_done") or 0) == 1 else ""
             di = f"{int(r.get('meal_di_score') or 0)}/10" if int(r.get("meal_di_done") or 0) == 1 else ""
 
-            # meds
-            med_m = "済" if int(r.get("med_morning") or 0) == 1 else ""
-            med_n = "済" if int(r.get("med_noon") or 0) == 1 else ""
-            med_e = "済" if int(r.get("med_evening") or 0) == 1 else ""
-            med_b = "済" if int(r.get("med_bed") or 0) == 1 else ""
+            med_m = "OK" if int(r.get("med_morning") or 0) == 1 else ""
+            med_n = "OK" if int(r.get("med_noon") or 0) == 1 else ""
+            med_e = "OK" if int(r.get("med_evening") or 0) == 1 else ""
+            med_b = "OK" if int(r.get("med_bed") or 0) == 1 else ""
 
             note = (r.get("note") or "").strip()
             note_short = note[:60] + ("…" if len(note) > 60 else "")
@@ -727,7 +723,6 @@ def build_week_table_for_submission(conn, residents_df: pd.DataFrame, unit_name:
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    # 日付→時刻で昇順
     out["_k"] = out["日付"].astype(str) + " " + out["時刻"].replace({"--:--": "99:99"})
     out = out.sort_values("_k").drop(columns=["_k"]).reset_index(drop=True)
     return out
@@ -981,6 +976,11 @@ textarea {{ border-radius: 14px !important; }}
   font-size: 12px;
   color: var(--muted);
 }}
+hr {{
+  border:none;
+  border-top:1px solid rgba(15,23,42,0.10);
+  margin:10px 0;
+}}
 </style>
         """,
         unsafe_allow_html=True,
@@ -988,15 +988,12 @@ textarea {{ border-radius: 14px !important; }}
 
 
 # -------------------------
-# New: daily status summary
+# Daily status summary
 # -------------------------
 def get_daily_status_map(conn, unit_id: int, target_date: str) -> pd.DataFrame:
     """
     当日(unit_id, target_date)の各利用者の「実施状況」を集計。
-    その日複数レコードがある場合は、以下を「その日の状態」として見る：
-      - バイタル：該当フィールドが1つでも非NULLなら済
-      - 食事：*_done が1のレコードがあれば済（scoreは最大値採用）
-      - 服薬：該当フラグが1のレコードがあれば済
+    複数レコードがある場合は「済（=1）」を優先し、スコアや体温は最大値を採用。
     """
     df = fetch_df(
         conn,
@@ -1173,44 +1170,74 @@ def main():
             st.caption("※ 場面を選択すると、フリーワード入力欄が表示されます。")
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # ② バイタル（デフォルト値保存）
+        # ② バイタル（空欄なし：初期値を常に持たせる）
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown('<div class="h">② バイタル（朝・夕）</div>', unsafe_allow_html=True)
         st.markdown(
-            "<div class='p'>※ 朝/夕の「記録する」をONにした場合、空欄でもデフォルト値（体温36.0・血圧120/80・脈拍70・SpO₂98）で安全に保存します。</div>",
+            "<div class='p'>※ 朝/夕の「記録する」をONにした場合、初期値（体温36.0・血圧120/80・脈拍70・SpO₂98）が入り、未入力（空）の状態を作りません。</div>",
             unsafe_allow_html=True,
         )
 
         latest = latest_vitals_anyday(conn, resident_id)
 
-        def ph_float(key, fmt="%.1f"):
-            v = safe_float(latest.get(key))
-            if v is None:
-                return ""
-            try:
-                return ("前回: " + (fmt % float(v)))
-            except Exception:
-                return f"前回: {v}"
-
-        def ph_int(key):
-            v = safe_int(latest.get(key))
-            return f"前回: {v}" if v is not None else ""
+        def _prev_line(prefix: str):
+            # 参考として前回値を表示（入力値は固定初期値から開始）
+            if prefix == "am":
+                temp = safe_float(latest.get("temp_am"))
+                sys = safe_int(latest.get("bp_sys_am"))
+                dia = safe_int(latest.get("bp_dia_am"))
+                pulse = safe_int(latest.get("pulse_am"))
+                spo2 = safe_int(latest.get("spo2_am"))
+            else:
+                temp = safe_float(latest.get("temp_pm"))
+                sys = safe_int(latest.get("bp_sys_pm"))
+                dia = safe_int(latest.get("bp_dia_pm"))
+                pulse = safe_int(latest.get("pulse_pm"))
+                spo2 = safe_int(latest.get("spo2_pm"))
+            parts = []
+            if temp is not None:
+                parts.append(f"体温 {temp:.1f}℃")
+            if sys is not None or dia is not None:
+                parts.append(f"血圧 {sys if sys is not None else '--'}/{dia if dia is not None else '--'}")
+            if pulse is not None:
+                parts.append(f"脈拍 {pulse}")
+            if spo2 is not None:
+                parts.append(f"SpO₂ {spo2}%")
+            return " / ".join(parts) if parts else ""
 
         st.markdown("**朝**")
         am_rec = st.toggle("朝バイタルを記録する", value=False, key=add_key("am_rec"))
-        am_temp_s = st.text_input("体温（℃）", value="", placeholder=ph_float("temp_am"), disabled=(not am_rec), key=add_key("am_temp_s"))
-        am_sys_s = st.text_input("血圧 上", value="", placeholder=ph_int("bp_sys_am"), disabled=(not am_rec), key=add_key("am_sys_s"))
-        am_dia_s = st.text_input("血圧 下", value="", placeholder=ph_int("bp_dia_am"), disabled=(not am_rec), key=add_key("am_dia_s"))
-        am_pulse_s = st.text_input("脈拍", value="", placeholder=ph_int("pulse_am"), disabled=(not am_rec), key=add_key("am_pulse_s"))
-        am_spo2_s = st.text_input("SpO₂", value="", placeholder=ph_int("spo2_am"), disabled=(not am_rec), key=add_key("am_spo2_s"))
+        prev_am = _prev_line("am")
+        if prev_am:
+            st.caption(f"参考（前回）: {prev_am}")
+
+        am_temp = st.number_input("体温（℃）", min_value=30.0, max_value=45.0, value=float(VITAL_DEFAULTS["temp"]),
+                                  step=0.1, format="%.1f", disabled=(not am_rec), key=add_key("am_temp"))
+        am_sys = st.number_input("血圧 上", min_value=50, max_value=250, value=int(VITAL_DEFAULTS["bp_sys"]),
+                                 step=1, disabled=(not am_rec), key=add_key("am_sys"))
+        am_dia = st.number_input("血圧 下", min_value=30, max_value=200, value=int(VITAL_DEFAULTS["bp_dia"]),
+                                 step=1, disabled=(not am_rec), key=add_key("am_dia"))
+        am_pulse = st.number_input("脈拍", min_value=20, max_value=200, value=int(VITAL_DEFAULTS["pulse"]),
+                                   step=1, disabled=(not am_rec), key=add_key("am_pulse"))
+        am_spo2 = st.number_input("SpO₂", min_value=50, max_value=100, value=int(VITAL_DEFAULTS["spo2"]),
+                                  step=1, disabled=(not am_rec), key=add_key("am_spo2"))
 
         st.markdown("**夕**")
         pm_rec = st.toggle("夕バイタルを記録する", value=False, key=add_key("pm_rec"))
-        pm_temp_s = st.text_input("体温（℃） ", value="", placeholder=ph_float("temp_pm"), disabled=(not pm_rec), key=add_key("pm_temp_s"))
-        pm_sys_s = st.text_input("血圧 上 ", value="", placeholder=ph_int("bp_sys_pm"), disabled=(not pm_rec), key=add_key("pm_sys_s"))
-        pm_dia_s = st.text_input("血圧 下 ", value="", placeholder=ph_int("bp_dia_pm"), disabled=(not pm_rec), key=add_key("pm_dia_s"))
-        pm_pulse_s = st.text_input("脈拍 ", value="", placeholder=ph_int("pulse_pm"), disabled=(not pm_rec), key=add_key("pm_pulse_s"))
-        pm_spo2_s = st.text_input("SpO₂ ", value="", placeholder=ph_int("spo2_pm"), disabled=(not pm_rec), key=add_key("pm_spo2_s"))
+        prev_pm = _prev_line("pm")
+        if prev_pm:
+            st.caption(f"参考（前回）: {prev_pm}")
+
+        pm_temp = st.number_input("体温（℃） ", min_value=30.0, max_value=45.0, value=float(VITAL_DEFAULTS["temp"]),
+                                  step=0.1, format="%.1f", disabled=(not pm_rec), key=add_key("pm_temp"))
+        pm_sys = st.number_input("血圧 上 ", min_value=50, max_value=250, value=int(VITAL_DEFAULTS["bp_sys"]),
+                                 step=1, disabled=(not pm_rec), key=add_key("pm_sys"))
+        pm_dia = st.number_input("血圧 下 ", min_value=30, max_value=200, value=int(VITAL_DEFAULTS["bp_dia"]),
+                                 step=1, disabled=(not pm_rec), key=add_key("pm_dia"))
+        pm_pulse = st.number_input("脈拍 ", min_value=20, max_value=200, value=int(VITAL_DEFAULTS["pulse"]),
+                                   step=1, disabled=(not pm_rec), key=add_key("pm_pulse"))
+        pm_spo2 = st.number_input("SpO₂ ", min_value=50, max_value=100, value=int(VITAL_DEFAULTS["spo2"]),
+                                  step=1, disabled=(not pm_rec), key=add_key("pm_spo2"))
 
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1225,13 +1252,13 @@ def main():
         di_score = st.slider("夕食量（1〜10）", 1, 10, value=5, key=add_key("di_score"), disabled=(not di_done))
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # ④ 服薬
+        # ④ 服薬（表記はOK）
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="h">④ 服薬</div>', unsafe_allow_html=True)
-        med_m = st.checkbox("朝", value=False, key=add_key("med_m"))
-        med_n = st.checkbox("昼", value=False, key=add_key("med_n"))
-        med_e = st.checkbox("夕", value=False, key=add_key("med_e"))
-        med_b = st.checkbox("寝る前", value=False, key=add_key("med_b"))
+        st.markdown('<div class="h">④ 服薬（OK）</div>', unsafe_allow_html=True)
+        med_m = st.checkbox("朝OK", value=False, key=add_key("med_m"))
+        med_n = st.checkbox("昼OK", value=False, key=add_key("med_n"))
+        med_e = st.checkbox("夕OK", value=False, key=add_key("med_e"))
+        med_b = st.checkbox("寝る前OK", value=False, key=add_key("med_b"))
         st.markdown("</div>", unsafe_allow_html=True)
 
         # ⑤ 巡視
@@ -1335,26 +1362,18 @@ def main():
                 else:
                     main_hh2, main_mm2 = main_hh, main_mm
 
-                # --- Vitals: if ON then use default when blank ---
-                def vital_float_or_default(txt, default):
-                    v = parse_float_str(txt)
-                    return default if v is None else v
+                # --- Vitals: if ON then always save (no blanks) ---
+                am_temp_v = float(am_temp) if bool(am_rec) else None
+                am_sys_v = int(am_sys) if bool(am_rec) else None
+                am_dia_v = int(am_dia) if bool(am_rec) else None
+                am_pulse_v = int(am_pulse) if bool(am_rec) else None
+                am_spo2_v = int(am_spo2) if bool(am_rec) else None
 
-                def vital_int_or_default(txt, default):
-                    v = parse_int_str(txt)
-                    return default if v is None else v
-
-                am_temp_v = vital_float_or_default(am_temp_s, VITAL_DEFAULTS["temp"]) if bool(am_rec) else None
-                am_sys_v = vital_int_or_default(am_sys_s, VITAL_DEFAULTS["bp_sys"]) if bool(am_rec) else None
-                am_dia_v = vital_int_or_default(am_dia_s, VITAL_DEFAULTS["bp_dia"]) if bool(am_rec) else None
-                am_pulse_v = vital_int_or_default(am_pulse_s, VITAL_DEFAULTS["pulse"]) if bool(am_rec) else None
-                am_spo2_v = vital_int_or_default(am_spo2_s, VITAL_DEFAULTS["spo2"]) if bool(am_rec) else None
-
-                pm_temp_v = vital_float_or_default(pm_temp_s, VITAL_DEFAULTS["temp"]) if bool(pm_rec) else None
-                pm_sys_v = vital_int_or_default(pm_sys_s, VITAL_DEFAULTS["bp_sys"]) if bool(pm_rec) else None
-                pm_dia_v = vital_int_or_default(pm_dia_s, VITAL_DEFAULTS["bp_dia"]) if bool(pm_rec) else None
-                pm_pulse_v = vital_int_or_default(pm_pulse_s, VITAL_DEFAULTS["pulse"]) if bool(pm_rec) else None
-                pm_spo2_v = vital_int_or_default(pm_spo2_s, VITAL_DEFAULTS["spo2"]) if bool(pm_rec) else None
+                pm_temp_v = float(pm_temp) if bool(pm_rec) else None
+                pm_sys_v = int(pm_sys) if bool(pm_rec) else None
+                pm_dia_v = int(pm_dia) if bool(pm_rec) else None
+                pm_pulse_v = int(pm_pulse) if bool(pm_rec) else None
+                pm_spo2_v = int(pm_spo2) if bool(pm_rec) else None
 
                 wakeup_flag = 1 if str(scene) == "起床" else 0
 
@@ -1426,6 +1445,11 @@ def main():
         status_df = get_daily_status_map(conn, unit_id, target_date_str)
         status_map = {int(r["resident_id"]): r for _, r in status_df.iterrows()} if not status_df.empty else {}
 
+        def pill(ok_flag, ok_text, ng_text):
+            if ok_flag:
+                return f"<span class='pill ok'>✅ {ok_text}</span>"
+            return f"<span class='pill ng'>{ng_text}</span>"
+
         st.markdown('<div class="grid">', unsafe_allow_html=True)
         for _, rr in residents_df.iterrows():
             rid = int(rr["id"])
@@ -1452,19 +1476,13 @@ def main():
             med_e = int(s["med_evening"]) == 1 if s is not None else False
             med_b = int(s["med_bed"]) == 1 if s is not None else False
 
-            def pill(ok_flag, label_ok="✅", label_ng="ー"):
-                if ok_flag:
-                    return f"<span class='pill ok'>{label_ok}</span>"
-                return f"<span class='pill ng'>{label_ng}</span>"
+            vit_am_txt = f"{temp_am:.1f}℃" if (vit_am_done and temp_am is not None) else ""
+            vit_pm_txt = f"{temp_pm:.1f}℃" if (vit_pm_done and temp_pm is not None) else ""
 
-            vit_am_txt = f"{temp_am:.1f}℃" if (vit_am_done and temp_am is not None) else "ー"
-            vit_pm_txt = f"{temp_pm:.1f}℃" if (vit_pm_done and temp_pm is not None) else "ー"
+            bf_txt = f"{meal_bf_score}/10" if meal_bf_done else ""
+            lu_txt = f"{meal_lu_score}/10" if meal_lu_done else ""
+            di_txt = f"{meal_di_score}/10" if meal_di_done else ""
 
-            bf_txt = f"{meal_bf_score}/10" if meal_bf_done else "ー"
-            lu_txt = f"{meal_lu_score}/10" if meal_lu_done else "ー"
-            di_txt = f"{meal_di_score}/10" if meal_di_done else "ー"
-
-            # 完了率（目安）
             done_count = sum([vit_am_done, vit_pm_done, meal_bf_done, meal_lu_done, meal_di_done, med_m, med_n, med_e, med_b])
             total = 9
             if done_count == total:
@@ -1482,21 +1500,21 @@ def main():
     <div>{head}</div>
   </div>
   <div class="small">区分:{kubun} / 病名:{disease}</div>
-  <hr style="border:none;border-top:1px solid rgba(15,23,42,0.10);margin:10px 0;">
+  <hr>
   <div style="font-weight:900;margin-bottom:6px;">バイタル</div>
-  <div>朝 {pill(vit_am_done, '✅ ' + vit_am_txt, 'ー')}</div>
-  <div>夕 {pill(vit_pm_done, '✅ ' + vit_pm_txt, 'ー')}</div>
+  <div>朝 {pill(vit_am_done, vit_am_txt if vit_am_txt else "記録あり", "未")}</div>
+  <div>夕 {pill(vit_pm_done, vit_pm_txt if vit_pm_txt else "記録あり", "未")}</div>
 
   <div style="font-weight:900;margin:10px 0 6px;">食事</div>
-  <div>朝 {pill(meal_bf_done, '✅ ' + bf_txt, 'ー')}</div>
-  <div>昼 {pill(meal_lu_done, '✅ ' + lu_txt, 'ー')}</div>
-  <div>夕 {pill(meal_di_done, '✅ ' + di_txt, 'ー')}</div>
+  <div>朝 {pill(meal_bf_done, bf_txt, "ー")}</div>
+  <div>昼 {pill(meal_lu_done, lu_txt, "ー")}</div>
+  <div>夕 {pill(meal_di_done, di_txt, "ー")}</div>
 
   <div style="font-weight:900;margin:10px 0 6px;">服薬</div>
-  <div>朝 {pill(med_m, '✅ 済', 'ー')}</div>
-  <div>昼 {pill(med_n, '✅ 済', 'ー')}</div>
-  <div>夕 {pill(med_e, '✅ 済', 'ー')}</div>
-  <div>寝 {pill(med_b, '✅ 済', 'ー')}</div>
+  <div>朝 {pill(med_m, "OK", "未")}</div>
+  <div>昼 {pill(med_n, "OK", "未")}</div>
+  <div>夕 {pill(med_e, "OK", "未")}</div>
+  <div>寝 {pill(med_b, "OK", "未")}</div>
 
   <div class="small" style="margin-top:10px;">完了 {done_count}/{total}</div>
 </div>
@@ -1505,7 +1523,7 @@ def main():
             )
         st.markdown("</div>", unsafe_allow_html=True)
 
-        st.caption("※ 実施状況は当日の全記録を集計して表示します（複数回入力がある場合は“済”を優先）。")
+        st.caption("※ 実施状況は当日の全記録を集計して表示します（複数回入力がある場合は“完了”を優先）。")
 
     # -------------------------
     # 経過一覧
@@ -1521,13 +1539,13 @@ def main():
             for _, r in recs.iterrows():
                 rid = int(r["id"])
                 t = fmt_time(r.get("record_time_hh"), r.get("record_time_mm"))
-                scene = scene_display(r.get("scene"))
+                scene2 = scene_display(r.get("scene"))
                 created_at = fmt_dt(r.get("created_at"))
                 updated_at = fmt_dt(r.get("updated_at"))
                 patrol_count = int(r.get("patrol_count", 0) or 0)
 
                 st.markdown('<div class="card">', unsafe_allow_html=True)
-                st.markdown(f"**{t}** 　<span class='badge'>{scene}</span> 　記録者：{r.get('recorder_name')}", unsafe_allow_html=True)
+                st.markdown(f"**{t}** 　<span class='badge'>{scene2}</span> 　記録者：{r.get('recorder_name')}", unsafe_allow_html=True)
                 st.markdown(f"<div class='meta'>作成:{created_at} / 更新:{updated_at} / 巡視:{patrol_count}回</div>", unsafe_allow_html=True)
 
                 sn = (r.get("scene_note") or "").strip()
@@ -1568,8 +1586,8 @@ def main():
                 if sys_pm is not None or dia_pm is not None:
                     pm["血圧"] = f"{sys_pm if sys_pm is not None else '--'}/{dia_pm if dia_pm is not None else '--'}"
 
-                def _vline(label, d):
-                    parts = [f"{k}:{v}" for k, v in d.items() if v not in (None, "", "--/--")]
+                def _vline(label, dct):
+                    parts = [f"{k}:{v}" for k, v in dct.items() if v not in (None, "", "--/--")]
                     return f"【{label}】" + " / ".join(parts) if parts else f"【{label}】記録なし"
 
                 st.markdown(f"- {_vline('バイタル（朝）', am)}")
@@ -1579,9 +1597,9 @@ def main():
                 lu_done0 = int(r.get("meal_lu_done") or 0)
                 di_done0 = int(r.get("meal_di_done") or 0)
                 meal_parts = []
-                meal_parts.append(f"朝:{int(r.get('meal_bf_score') or 0)}" if bf_done0 else "朝:-")
-                meal_parts.append(f"昼:{int(r.get('meal_lu_score') or 0)}" if lu_done0 else "昼:-")
-                meal_parts.append(f"夕:{int(r.get('meal_di_score') or 0)}" if di_done0 else "夕:-")
+                meal_parts.append(f"朝:{int(r.get('meal_bf_score') or 0)}/10" if bf_done0 else "朝:-")
+                meal_parts.append(f"昼:{int(r.get('meal_lu_score') or 0)}/10" if lu_done0 else "昼:-")
+                meal_parts.append(f"夕:{int(r.get('meal_di_score') or 0)}/10" if di_done0 else "夕:-")
                 if bf_done0 or lu_done0 or di_done0:
                     st.markdown("- 【食事】" + " / ".join(meal_parts))
                 else:
@@ -1589,13 +1607,13 @@ def main():
 
                 meds = []
                 if int(r.get("med_morning") or 0) == 1:
-                    meds.append("朝")
+                    meds.append("朝OK")
                 if int(r.get("med_noon") or 0) == 1:
-                    meds.append("昼")
+                    meds.append("昼OK")
                 if int(r.get("med_evening") or 0) == 1:
-                    meds.append("夕")
+                    meds.append("夕OK")
                 if int(r.get("med_bed") or 0) == 1:
-                    meds.append("寝る前")
+                    meds.append("寝る前OK")
                 if meds:
                     st.markdown("- 【服薬】" + " / ".join(meds))
                 else:
@@ -1637,7 +1655,7 @@ def main():
     # -------------------------
     with tab_ho:
         st.markdown("### 🗒️ 申し送り（連絡帳）")
-        st.caption("⑥特記事項（チェックONで保存）→ここに自動反映。リアクションは 👍 のみ。")
+        st.caption("⑥特記事項（チェックONで保存）→ここに自動反映。リアクションは 👍 のみ。投稿は削除できます。")
 
         st.markdown("#### ➕ 新規申し送り作成")
         st.caption("特記事項以外の連絡も、ここから直接投稿できます。")
@@ -1702,6 +1720,7 @@ def main():
                 st.markdown(f"<div class='meta'>投稿：{created_at} / 投稿者：{who}</div>", unsafe_allow_html=True)
                 st.markdown(f"<div class='meta' style='font-weight:900;'>{like_line}</div>", unsafe_allow_html=True)
 
+                # Like
                 if recorder_name.strip() == "":
                     st.warning("👍 を押すには、サイドバーの『記録者名』を入力してください。")
                 else:
@@ -1710,6 +1729,12 @@ def main():
                     if st.button(btn_txt, key=f"like_{hid}"):
                         toggle_like(conn, handover_id=hid, user_name=recorder_name.strip())
                         st.rerun()
+
+                # Delete (soft)
+                if st.button("🗑️ この申し送りを削除", key=f"del_ho_{hid}"):
+                    soft_delete_handover(conn, hid)
+                    st.success("✅ 削除しました")
+                    st.rerun()
 
                 if like_count > 0:
                     with st.expander("👍 履歴（誰がいつ）", expanded=False):
@@ -1752,7 +1777,7 @@ def main():
         st.markdown(f"期間：{start_s} 〜 {end_s}（7日間）")
 
         st.divider()
-        st.markdown("#### ① 時系列（従来のタイムライン形式）")
+        st.markdown("#### ① 時系列（タイムライン形式）")
         df_week = build_week_timeline(conn, pr_resident_id, start_s, end_s)
         if df_week.empty:
             st.info("この期間の記録はありません。")
